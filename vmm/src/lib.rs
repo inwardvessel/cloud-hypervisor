@@ -1086,16 +1086,20 @@ impl Vmm {
             config.lock().unwrap().cpus.max_phys_bits,
         );
 
-        let memory_manager = MemoryManager::new(
-            vm,
-            &config.lock().unwrap().memory.clone(),
-            None,
-            phys_bits,
-            #[cfg(feature = "tdx")]
-            false,
-            Some(&vm_migration_config.memory_manager_data),
-            existing_memory_files,
-        )
+        let memory_manager = {
+            let cfg = config.lock().unwrap();
+            MemoryManager::new(
+                vm,
+                &cfg.memory,
+                None,
+                phys_bits,
+                #[cfg(feature = "tdx")]
+                false,
+                Some(&vm_migration_config.memory_manager_data),
+                existing_memory_files,
+                cfg.cpus.max_vcpus,
+            )
+        }
         .map_err(|e| {
             MigratableError::MigrateReceive(anyhow!(
                 "Error creating MemoryManager from snapshot: {e:?}"

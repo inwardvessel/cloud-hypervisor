@@ -588,9 +588,19 @@ impl Vm {
 
         info!("Booting VM from config: {:?}", &config);
 
-        // Create NUMA nodes based on NumaConfig.
-        let numa_nodes =
-            Self::create_numa_nodes(config.lock().unwrap().numa.as_deref(), &memory_manager)?;
+        let numa_configs = config
+            .lock()
+            .unwrap()
+            .numa
+            .clone()
+            .or_else(|| {
+                memory_manager
+                    .lock()
+                    .unwrap()
+                    .numa_configs()
+                    .map(|c| c.to_vec())
+            });
+        let numa_nodes = Self::create_numa_nodes(numa_configs.as_deref(), &memory_manager)?;
 
         // Determine if VIRTIO_F_ACCESS_PLATFORM should be forced (e.g. for TDX/SEV-SNP)
         let force_access_platform = Self::should_force_access_platform(&config);
@@ -1384,27 +1394,31 @@ impl Vm {
 
         let memory_manager =
             if let Some(snapshot) = snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID) {
+                let cfg = vm_config.lock().unwrap();
                 MemoryManager::new_from_snapshot(
                     snapshot,
                     vm.clone(),
-                    &vm_config.lock().unwrap().memory.clone(),
+                    &cfg.memory,
                     source_url,
                     prefault.unwrap_or(false),
                     memory_restore_mode.unwrap_or_default(),
                     phys_bits,
                     &exit_evt,
+                    cfg.cpus.max_vcpus,
                 )
                 .map_err(Error::MemoryManager)?
             } else {
+                let cfg = vm_config.lock().unwrap();
                 MemoryManager::new(
                     vm.clone(),
-                    &vm_config.lock().unwrap().memory.clone(),
+                    &cfg.memory,
                     None,
                     phys_bits,
                     #[cfg(feature = "tdx")]
                     tdx_enabled,
                     None,
                     Default::default(),
+                    cfg.cpus.max_vcpus,
                 )
                 .map_err(Error::MemoryManager)?
             };

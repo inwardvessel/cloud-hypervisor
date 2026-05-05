@@ -55,7 +55,7 @@ use crate::coredump::{
     CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
 };
 use crate::migration::url_to_path;
-use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
+use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig, NumaConfig};
 use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID, uffd};
 
 /// Find the next populated (data) extent in `[cursor, end)` of `fd`,
@@ -110,6 +110,7 @@ struct UffdRange {
 pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
 
 const DEFAULT_MEMORY_ZONE: &str = "mem0";
+const HOTPLUG_MEMORY_ZONE: &str = "mem0-hotplug";
 
 const SNAPSHOT_FILENAME: &str = "memory-ranges";
 
@@ -274,6 +275,7 @@ pub struct MemoryManager {
     pub acpi_address: Option<GuestAddress>,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     uefi_flash: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    numa_configs: Option<Vec<NumaConfig>>,
 }
 
 #[derive(Error, Debug)]
@@ -689,33 +691,33 @@ impl MemoryManager {
                     ram_region_available_size
                 };
 
-                info!(
-                    "create ram region for zone {}, region_start: {:#x}, region_size: {:#x}",
-                    zone.id,
-                    region_start.raw_value(),
-                    region_size
-                );
-                let region = MemoryManager::create_ram_region(
-                    &zone.file,
-                    file_offset,
-                    region_start,
-                    region_size as usize,
-                    prefault.unwrap_or(zone.prefault),
-                    zone.shared,
-                    zone.hugepages,
-                    zone.hugepage_size,
-                    zone.host_numa_node,
-                    None,
-                    thp,
-                )?;
+                if region_size > 0 {
+                    info!(
+                        "create ram region for zone {}, region_start: {:#x}, region_size: {:#x}",
+                        zone.id,
+                        region_start.raw_value(),
+                        region_size
+                    );
+                    let region = MemoryManager::create_ram_region(
+                        &zone.file,
+                        file_offset,
+                        region_start,
+                        region_size as usize,
+                        prefault.unwrap_or(zone.prefault),
+                        zone.shared,
+                        zone.hugepages,
+                        zone.hugepage_size,
+                        zone.host_numa_node,
+                        None,
+                        thp,
+                    )?;
 
-                // Add region to the list of regions associated with the
-                // current memory zone.
-                if let Some(memory_zone) = memory_zones.get_mut(&zone.id) {
-                    memory_zone.regions.push(region.clone());
+                    if let Some(memory_zone) = memory_zones.get_mut(&zone.id) {
+                        memory_zone.regions.push(region.clone());
+                    }
+
+                    mem_regions.push(region);
                 }
-
-                mem_regions.push(region);
 
                 if pull_next_zone {
                     // Get the next zone and reset the offset.
@@ -1376,9 +1378,7 @@ impl MemoryManager {
                 }
             }
 
-            // Create a single zone from the global memory config. This lets
-            // us reuse the codepath for user defined memory zones.
-            let zones = vec![MemoryZoneConfig {
+            let mut zones = vec![MemoryZoneConfig {
                 id: String::from(DEFAULT_MEMORY_ZONE),
                 size: config.size,
                 file: None,
@@ -1386,11 +1386,29 @@ impl MemoryManager {
                 hugepages: config.hugepages,
                 hugepage_size: config.hugepage_size,
                 host_numa_node: None,
-                hotplug_size: config.hotplug_size,
-                hotplugged_size: config.hotplugged_size,
+                // Hotplug is handled by a separate zone to avoid creating
+                // a virtio-mem region on the boot zone.
+                hotplug_size: None,
+                hotplugged_size: None,
                 prefault: config.prefault,
                 mergeable: config.mergeable,
             }];
+
+            if config.hotplug_size.is_some() {
+                zones.push(MemoryZoneConfig {
+                    id: String::from(HOTPLUG_MEMORY_ZONE),
+                    size: 0,
+                    file: None,
+                    shared: false,
+                    hugepages: config.hugepages,
+                    hugepage_size: config.hugepage_size,
+                    host_numa_node: None,
+                    hotplug_size: config.hotplug_size,
+                    hotplugged_size: config.hotplugged_size,
+                    prefault: config.prefault,
+                    mergeable: config.mergeable,
+                });
+            }
 
             Ok((config.size, zones, allow_mem_hotplug))
         }
@@ -1509,6 +1527,7 @@ impl MemoryManager {
         #[cfg(feature = "tdx")] tdx_enabled: bool,
         restore_data: Option<&MemoryManagerSnapshotData>,
         existing_memory_files: HashMap<u32, File>,
+        max_vcpus: u32,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         trace_scoped!("MemoryManager::new");
 
@@ -1525,6 +1544,29 @@ impl MemoryManager {
 
         let (ram_size, zones, allow_mem_hotplug) =
             Self::validate_memory_config(config, user_provided_zones)?;
+
+        let numa_configs = if zones.iter().any(|z| z.id == HOTPLUG_MEMORY_ZONE) {
+            Some(vec![
+                NumaConfig {
+                    guest_numa_id: 0,
+                    cpus: Some((0..max_vcpus).collect()),
+                    distances: None,
+                    memory_zones: Some(vec![DEFAULT_MEMORY_ZONE.to_string()]),
+                    pci_segments: None,
+                    device_id: None,
+                },
+                NumaConfig {
+                    guest_numa_id: 1,
+                    cpus: None,
+                    distances: None,
+                    memory_zones: Some(vec![HOTPLUG_MEMORY_ZONE.to_string()]),
+                    pci_segments: None,
+                    device_id: None,
+                },
+            ])
+        } else {
+            None
+        };
 
         let (
             start_of_device_area,
@@ -1749,6 +1791,7 @@ impl MemoryManager {
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             uefi_flash: None,
             thp: config.thp,
+            numa_configs,
         };
 
         Ok(Arc::new(Mutex::new(memory_manager)))
@@ -1764,6 +1807,7 @@ impl MemoryManager {
         memory_restore_mode: MemoryRestoreMode,
         phys_bits: u8,
         exit_evt: &EventFd,
+        max_vcpus: u32,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         if let Some(source_url) = source_url {
             let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
@@ -1781,6 +1825,7 @@ impl MemoryManager {
                 false,
                 Some(&mem_snapshot),
                 Default::default(),
+                max_vcpus,
             )?;
 
             if memory_restore_mode == MemoryRestoreMode::OnDemand {
@@ -2473,7 +2518,7 @@ impl MemoryManager {
                         return Ok(region);
                     }
 
-                    self.virtio_mem_resize(DEFAULT_MEMORY_ZONE, desired_ram - self.boot_ram)?;
+                    self.virtio_mem_resize(HOTPLUG_MEMORY_ZONE, desired_ram - self.boot_ram)?;
                     self.current_ram = desired_ram;
                 }
             }
@@ -2532,6 +2577,10 @@ impl MemoryManager {
 
     pub fn memory_zones(&self) -> &MemoryZones {
         &self.memory_zones
+    }
+
+    pub fn numa_configs(&self) -> Option<&[NumaConfig]> {
+        self.numa_configs.as_deref()
     }
 
     pub fn memory_zones_mut(&mut self) -> &mut MemoryZones {
